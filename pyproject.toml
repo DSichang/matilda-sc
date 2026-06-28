@@ -1,0 +1,46 @@
+# matilda-sc packaging.
+# Distribution name: matilda-sc   |   import name: matilda
+# Model code is UNCHANGED from the published engine; this round modernizes only
+# the call side (importability, I/O, return objects). See UPGRADE notes.
+#
+# TODO before publishing to PyPI:
+#   - confirm `license` and `authors`/`maintainers` with upstream (PYangLab/Matilda)
+#   - confirm the release `version`
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "matilda-sc"
+version = "0.2.0"
+description = "Multi-task framework for single-cell multimodal data (classification, dimension reduction, feature selection, simulation, augmentation) across RNA / ADT / ATAC."
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [{ name = "Chunlei Liu", email = "chunlei@cmri.com" }]
+keywords = ["single-cell", "multimodal", "deep-learning", "CITE-seq", "TEA-seq", "scRNA-seq", "ATAC"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "torch",
+    "captum",
+    "h5py",
+    "numpy",
+    "pandas",
+    "scipy",
+    "tqdm",
+]
+
+# Optional extras for the forthcoming object API (matilda.io / matilda.api).
+# Uncomment when those modules land:
+# [project.optional-dependencies]
+# io = ["anndata", "scanpy"]
+
+[project.urls]
+Homepage = "https://github.com/DSichang/matilda-sc"
+
+[tool.setuptools.packages.find]
+where = ["src"]

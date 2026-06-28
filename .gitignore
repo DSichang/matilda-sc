@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Matilda run artifacts (written relative to CWD by the path-based API)
+trained_model/
+output/
+
+# OS / editors
+.DS_Store
+.ipynb_checkpoints/
