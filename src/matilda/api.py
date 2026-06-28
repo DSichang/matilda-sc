@@ -37,7 +37,7 @@ from .main_matilda_task import main_task
 from .main_matilda_rna_train import rna_train
 from .main_matilda_rna_task import rna_task
 
-__all__ = ["train", "task", "TrainResult", "TaskResult", "resolve_device"]
+__all__ = ["train", "task", "transfer", "TrainResult", "TaskResult", "resolve_device"]
 
 _MODE_DIRS = ("TEAseq", "CITEseq", "SHAREseq", "rna_only", "RNAseq")
 
@@ -86,6 +86,7 @@ class TaskResult:
     markers: Optional[pd.DataFrame] = None
     simulated: Optional[Dict[str, pd.DataFrame]] = None
     out_dir: Optional[str] = None
+    common_features: Optional[Dict[str, int]] = None  # set by transfer(): per-modality #common
 
     def __repr__(self):
         got = [n for n in ("predictions", "celltype_accuracy", "latent", "markers",
@@ -498,4 +499,80 @@ def task(rna, adt=None, atac=None, labels=None, *, model=None, classification=Fa
             shutil.copytree(out_root, dst)
             res.out_dir = out_dir
 
+    return res
+
+
+def _intersect_anndata(ref, qry):
+    """Restrict two AnnData to their common features (reference order); return (ref_sub, qry_sub)."""
+    if not hasattr(ref, "var_names") or not hasattr(qry, "var_names"):
+        raise ValueError("transfer() needs AnnData inputs with feature names (var_names).")
+    qset = set(str(v) for v in qry.var_names)
+    seen, common = set(), []
+    for v in (str(x) for x in ref.var_names):
+        if v in qset and v not in seen:
+            common.append(v); seen.add(v)
+    if not common:
+        raise ValueError("reference and query share no common features in a modality.")
+    return ref[:, common].copy(), qry[:, common].copy()
+
+
+def transfer(reference, query, labels=None, query_labels=None, *,
+             classification=True, dim_reduce=False, fs=False, simulation=False,
+             fs_method="IntegratedGradient", simulation_ct=None, simulation_num=100,
+             include_real=False, batch_size=64, epochs=30, lr=0.02, z_dim=100,
+             hidden_rna=185, hidden_adt=30, hidden_atac=185, seed=1,
+             out_dir=None, device="auto"):
+    """Transfer labels (and/or other tasks) from a labeled reference to a query whose
+    features only partially overlap.
+
+    Computes the per-modality **feature intersection** (in reference order), trains a model
+    on the intersection, and applies it to the query — real values only, **no zero-padding**.
+    This is the right approach when the query both misses some reference features *and* adds
+    others. Because the model is trained on the reference∩query feature set, both ``reference``
+    and ``query`` are needed together (a different query → a different intersection → its own
+    model).
+
+    Parameters
+    ----------
+    reference, query : AnnData | dict
+        Each is an ``AnnData`` (RNA only) or a dict ``{"rna": AnnData, "adt": AnnData,
+        "atac": AnnData}`` (ADT/ATAC optional). Only modalities present in **both** are used.
+    labels : reference cell-type labels (vector / ``.obs`` column name / ``.csv`` path) — required.
+    query_labels : optional ground-truth labels for the query (adds the accuracy report).
+
+    Returns
+    -------
+    :class:`TaskResult` for the query, with ``.common_features`` recording how many features
+    each modality kept after intersection.
+    """
+    if labels is None:
+        raise ValueError("transfer() requires labels (the reference's cell-type labels).")
+    ref = reference if isinstance(reference, dict) else {"rna": reference}
+    qry = query if isinstance(query, dict) else {"rna": query}
+    if ref.get("rna") is None or qry.get("rna") is None:
+        raise ValueError("reference and query must each include an 'rna' modality.")
+    for m in ("adt", "atac"):
+        if (ref.get(m) is not None) != (qry.get(m) is not None):
+            warnings.warn("modality %r is present in only one of reference/query; it will be "
+                          "dropped (only modalities present in both are used)." % m, RuntimeWarning)
+    mods = [m for m in ("rna", "adt", "atac") if ref.get(m) is not None and qry.get(m) is not None]
+
+    ref_sub, qry_sub, common = {}, {}, {}
+    for m in mods:
+        rs, qs = _intersect_anndata(ref[m], qry[m])
+        ref_sub[m], qry_sub[m] = rs, qs
+        common[m] = int(rs.n_vars)
+
+    fit = train(ref_sub["rna"], adt=ref_sub.get("adt"), atac=ref_sub.get("atac"),
+                labels=labels, batch_size=batch_size, epochs=epochs, lr=lr, z_dim=z_dim,
+                hidden_rna=hidden_rna, hidden_adt=hidden_adt, hidden_atac=hidden_atac,
+                seed=seed, device=device)
+    res = task(qry_sub["rna"], adt=qry_sub.get("adt"), atac=qry_sub.get("atac"),
+               labels=query_labels, model=fit, classification=classification, query=True,
+               fs=fs, fs_method=fs_method, dim_reduce=dim_reduce, simulation=simulation,
+               simulation_ct=simulation_ct, simulation_num=simulation_num,
+               include_real=include_real, batch_size=batch_size, z_dim=z_dim,
+               hidden_rna=hidden_rna, hidden_adt=hidden_adt, hidden_atac=hidden_atac,
+               seed=seed, out_dir=out_dir, device=device)
+    res.common_features = common
     return res

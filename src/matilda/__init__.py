@@ -25,7 +25,7 @@ from .main_matilda_task import main_task
 from .main_matilda_rna_train import rna_train
 from .main_matilda_rna_task import rna_task
 
-from .api import train, task, TrainResult, TaskResult
+from .api import train, task, transfer, TrainResult, TaskResult
 
 __version__ = "0.2.0"
 
@@ -33,6 +33,7 @@ __all__ = [
     # object API (recommended)
     "train",
     "task",
+    "transfer",
     "TrainResult",
     "TaskResult",
     # raw path-based engine functions
