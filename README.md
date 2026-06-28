@@ -24,7 +24,8 @@ pip install matilda-sc
 
 ## Quickstart (object API — recommended)
 
-Work with in-memory `AnnData` (or arrays, or file paths) and get results back as objects:
+Work with in-memory `AnnData` (or arrays, or file paths) and get results back as objects.
+After `train`, there is one verb per task: `classify` / `reduce` / `markers` / `simulate`.
 
 ```python
 import matilda
@@ -33,19 +34,36 @@ import matilda
 # labels: a vector, an `.obs` column name, or a .csv path (string or numeric labels)
 fit = matilda.train(rna, adt=adt, atac=atac, labels="cell_type")
 
-res = matilda.task(q_rna, adt=q_adt, atac=q_atac, labels=q_labels,
-                   model=fit, classification=True, query=True)
-
+# each verb takes the data (AnnData or {"rna","adt","atac"}) and the trained model
+res = matilda.classify({"rna": q_rna, "adt": q_adt, "atac": q_atac},
+                       model=fit, query_labels=q_labels)
 res.predictions        # DataFrame: cell_id, real, predicted, probability
 res.celltype_accuracy  # DataFrame: celltype, accuracy, n
+
+lat = matilda.reduce({"rna": rna, "adt": adt, "atac": atac}, model=fit)                 # lat.latent
+mk  = matilda.markers({"rna": rna, "adt": adt, "atac": atac}, model=fit, labels="cell_type")  # mk.markers
+sim = matilda.simulate({"rna": rna}, model=fit, celltype="B.Naive", n=200)             # sim.simulated
 ```
 
 The modality combination is inferred automatically (RNA only → RNA-only model; +ADT →
-CITE-seq; +ATAC → SHARE-seq; +both → TEA-seq). Other tasks share the same call —
-`task(..., dim_reduce=True, fs=True, simulation=True, simulation_ct="B.Naive")` populates
-`res.latent`, `res.markers`, and `res.simulated`. Pass `out_dir=` to also write the
-artifacts to disk; otherwise the trained model lives in a temp dir (`fit.model_dir`) for
-the session and is cleaned up at exit.
+CITE-seq; +ATAC → SHARE-seq; +both → TEA-seq).
+
+**`classify` reconciles features automatically.** The call is the same whether or not the
+query shares the reference panel: if the query carries every feature the model needs it
+reuses the model; if it is missing some (the common cross-dataset case) it takes the
+per-modality reference∩query **intersection** — real values, **no zero-padding** — retrains
+on it, and classifies. `res.retrained` / `res.common_features` report what happened:
+
+```python
+res = matilda.classify({"rna": q_rna_small, "adt": q_adt, "atac": q_atac},
+                       model=fit, reference={"rna": rna, "adt": adt, "atac": atac},
+                       labels="cell_type", query_labels=q_labels)
+```
+
+The combinable `matilda.task(..., classification=True, dim_reduce=True, fs=True,
+simulation=True)` runs any mix of tasks in one engine pass (the verbs wrap it). Pass
+`out_dir=` to also write artifacts to disk; otherwise the trained model lives in a temp
+dir (`fit.model_dir`) for the session and is cleaned up at exit.
 
 I/O helpers in `matilda.io` convert to/from the engine's format:
 `read_matilda_h5`, `to_matilda_h5`, `to_matilda_cty`, `from_10x(dir)` (reads ADT/ATAC too).

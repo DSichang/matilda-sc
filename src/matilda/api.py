@@ -37,7 +37,8 @@ from .main_matilda_task import main_task
 from .main_matilda_rna_train import rna_train
 from .main_matilda_rna_task import rna_task
 
-__all__ = ["train", "task", "transfer", "TrainResult", "TaskResult", "resolve_device"]
+__all__ = ["train", "task", "classify", "reduce", "markers", "simulate",
+           "TrainResult", "TaskResult", "resolve_device"]
 
 _MODE_DIRS = ("TEAseq", "CITEseq", "SHAREseq", "rna_only", "RNAseq")
 
@@ -68,6 +69,10 @@ class TrainResult:
     classes: List[str]
     out_dir: Optional[str] = None
     train_acc: Optional[float] = None  # not populated under approach (A)
+    # Per-modality ordered feature names the model was trained on ({"rna": [...], ...}).
+    # Used by classify() to decide reuse-vs-retrain and to slice a query to the model's
+    # exact feature order. None when training inputs carried no names (bare arrays).
+    features: Optional[Dict[str, List[str]]] = None
 
     def __repr__(self):
         return ("TrainResult(mode=%r, n_classes=%d, model_path=%r)"
@@ -86,7 +91,9 @@ class TaskResult:
     markers: Optional[pd.DataFrame] = None
     simulated: Optional[Dict[str, pd.DataFrame]] = None
     out_dir: Optional[str] = None
-    common_features: Optional[Dict[str, int]] = None  # set by transfer(): per-modality #common
+    common_features: Optional[Dict[str, int]] = None  # classify(): per-modality #features used
+    retrained: Optional[bool] = None                  # classify(): True if it retrained on an
+    #                                                   intersection, False if it reused the model
 
     def __repr__(self):
         got = [n for n in ("predictions", "celltype_accuracy", "latent", "markers",
@@ -169,6 +176,40 @@ def _resolve_labels(labels, rna):
 def _classes_from_labels(labels_vec):
     """Class order as the engine binds it: alphabetical categories of the STRING labels."""
     return list(pd.Categorical([str(x) for x in labels_vec]).categories)
+
+
+def _h5_features(path):
+    """Read the ordered feature names from a staged Matilda ``.h5`` (or None for 'NULL')."""
+    if not isinstance(path, str) or path == "NULL" or not os.path.isfile(path):
+        return None
+    import h5py
+    with h5py.File(path, "r") as f:
+        return [s.decode("utf-8") if isinstance(s, (bytes, bytearray)) else str(s)
+                for s in f["matrix/features"][:]]
+
+
+def _var_names(obj):
+    """Ordered feature names of an in-memory AnnData, or None if it carries none."""
+    vn = getattr(obj, "var_names", None)
+    if vn is None:
+        return None
+    return [str(v) for v in vn]
+
+
+def _select_features(adata, feats):
+    """Restrict an AnnData to ``feats`` (exact set + order); requires named columns."""
+    return adata[:, list(feats)].copy()
+
+
+def _as_mods(x):
+    """Normalize an AnnData / dict input to a ``{"rna","adt","atac"}`` dict (rna required)."""
+    return x if isinstance(x, dict) else {"rna": x}
+
+
+def _unpack(x):
+    """Return ``(rna, adt, atac)`` from an AnnData / dict input."""
+    d = _as_mods(x)
+    return d.get("rna"), d.get("adt"), d.get("atac")
 
 
 def _infer_n_cells(rna, labels_vec):
@@ -357,6 +398,14 @@ def train(rna, adt=None, atac=None, labels=None, *, batch_size=64, epochs=30, lr
         atac_p = _stage_modality(atac, "atac", stage, n_cells)
         cty_p = _stage_labels(labels_vec, stage)
 
+        # Record the model's per-modality feature order (from the staged .h5, i.e. exactly
+        # what the engine trained on) so classify() can reuse the model on a matching query.
+        feat = {}
+        for nm, p in (("rna", rna_p), ("adt", adt_p), ("atac", atac_p)):
+            fl = _h5_features(p)
+            if fl is not None:
+                feat[nm] = fl
+
         if mode == "rna_only":
             rna_train(rna_p, cty_p, batch_size=batch_size, epochs=epochs, lr=lr,
                       z_dim=z_dim, hidden_rna=hidden_rna, seed=seed, augmentation=augmentation)
@@ -384,7 +433,7 @@ def train(rna, adt=None, atac=None, labels=None, *, batch_size=64, epochs=30, lr
         _write_classes(classes, dest_root)     # keep classes alongside the model
 
     return TrainResult(model_path=model_path, model_dir=model_dir, mode=mode,
-                       classes=classes, out_dir=out_dir)
+                       classes=classes, out_dir=out_dir, features=(feat or None))
 
 
 def task(rna, adt=None, atac=None, labels=None, *, model=None, classification=False,
@@ -516,41 +565,84 @@ def _intersect_anndata(ref, qry):
     return ref[:, common].copy(), qry[:, common].copy()
 
 
-def transfer(reference, query, labels=None, query_labels=None, *,
-             classification=True, dim_reduce=False, fs=False, simulation=False,
-             fs_method="IntegratedGradient", simulation_ct=None, simulation_num=100,
-             include_real=False, batch_size=64, epochs=30, lr=0.02, z_dim=100,
-             hidden_rna=185, hidden_adt=30, hidden_atac=185, seed=1,
-             out_dir=None, device="auto"):
-    """Transfer labels (and/or other tasks) from a labeled reference to a query whose
-    features only partially overlap.
+def classify(query, model=None, reference=None, labels=None, query_labels=None, *,
+             batch_size=64, z_dim=100, hidden_rna=185, hidden_adt=30, hidden_atac=185,
+             epochs=30, lr=0.02, augmentation=True, seed=1, out_dir=None, device="auto"):
+    """Label ``query`` cells against a labeled reference.
 
-    Computes the per-modality **feature intersection** (in reference order), trains a model
-    on the intersection, and applies it to the query — real values only, **no zero-padding**.
-    This is the right approach when the query both misses some reference features *and* adds
-    others. Because the model is trained on the reference∩query feature set, both ``reference``
-    and ``query`` are needed together (a different query → a different intersection → its own
-    model).
+    One call handles both the matched and the cross-dataset case; ``classify`` decides from the
+    feature overlap whether it can **reuse** ``model`` or must **retrain**:
+
+    * **the query carries every feature the model was trained on** (equal panel, or the query is
+      a superset) → slice the query to the model's features, reuse the model, classify. No
+      retrain. (``reference`` / ``labels`` are accepted but unused on this path.)
+    * **the query is missing some of the model's features** (the common cross-dataset case —
+      misses some, may add others) → take the per-modality **intersection** of ``reference`` and
+      ``query`` (reference order, real values only, **no zero-padding**), retrain on it, and
+      classify. (``model``, if given, is ignored here.)
 
     Parameters
     ----------
-    reference, query : AnnData | dict
-        Each is an ``AnnData`` (RNA only) or a dict ``{"rna": AnnData, "adt": AnnData,
-        "atac": AnnData}`` (ADT/ATAC optional). Only modalities present in **both** are used.
-    labels : reference cell-type labels (vector / ``.obs`` column name / ``.csv`` path) — required.
+    query : AnnData | dict
+        Cells to label — an ``AnnData`` (RNA only) or ``{"rna","adt","atac"}`` (ADT/ATAC
+        optional). Reuse-detection needs in-memory feature names (``var_names``).
+    model : TrainResult, optional
+        A model from :func:`train`; enables the no-retrain reuse path. Omit it for pure
+        cross-dataset transfer (a model is then trained from ``reference`` on the intersection).
+    reference : AnnData | dict, optional
+        The labeled reference. Required only when a retrain is needed (the query misses model
+        features, or no ``model`` was given). Only modalities present in both are used.
+    labels : reference cell-type labels (vector / ``.obs`` column name / ``.csv`` path) —
+        required whenever a retrain is needed.
     query_labels : optional ground-truth labels for the query (adds the accuracy report).
 
     Returns
     -------
-    :class:`TaskResult` for the query, with ``.common_features`` recording how many features
-    each modality kept after intersection.
+    :class:`TaskResult` with ``.predictions``; ``.retrained`` records which path ran and
+    ``.common_features`` the per-modality feature counts actually used.
     """
-    if labels is None:
-        raise ValueError("transfer() requires labels (the reference's cell-type labels).")
-    ref = reference if isinstance(reference, dict) else {"rna": reference}
-    qry = query if isinstance(query, dict) else {"rna": query}
-    if ref.get("rna") is None or qry.get("rna") is None:
-        raise ValueError("reference and query must each include an 'rna' modality.")
+    qry = _as_mods(query)
+    if qry.get("rna") is None:
+        raise ValueError("classify() needs an 'rna' modality in the query.")
+
+    # ---- decide reuse vs retrain from the feature overlap ----
+    can_reuse = False
+    reuse_mods = []
+    if isinstance(model, TrainResult) and model.features:
+        reuse_mods = [m for m in ("rna", "adt", "atac") if model.features.get(m)]
+        # the query must supply every modality the model needs, with names covering its
+        # feature set (so the query can be sliced to the model's exact features + order)
+        if reuse_mods and all(qry.get(m) is not None for m in reuse_mods):
+            covered = True
+            for m in reuse_mods:
+                qv = _var_names(qry[m])
+                if qv is None or not set(model.features[m]).issubset(set(qv)):
+                    covered = False
+                    break
+            can_reuse = covered
+
+    if can_reuse:
+        q_sub = {m: _select_features(qry[m], model.features[m]) for m in reuse_mods}
+        res = task(q_sub["rna"], adt=q_sub.get("adt"), atac=q_sub.get("atac"),
+                   labels=query_labels, model=model, classification=True, query=True,
+                   batch_size=batch_size, z_dim=z_dim, hidden_rna=hidden_rna,
+                   hidden_adt=hidden_adt, hidden_atac=hidden_atac, seed=seed,
+                   out_dir=out_dir, device=device)
+        res.retrained = False
+        res.common_features = {m: len(model.features[m]) for m in reuse_mods}
+        return res
+
+    # ---- retrain on the reference∩query intersection ----
+    if reference is None or labels is None:
+        raise ValueError(
+            "classify() must retrain (the query is missing features the model was trained on, "
+            "or no usable model was given) but reference= / labels= were not supplied. Pass the "
+            "labeled reference and its labels so classify can train on the reference∩query "
+            "intersection."
+        )
+    ref = _as_mods(reference)
+    if ref.get("rna") is None:
+        raise ValueError("classify() needs an 'rna' modality in the reference.")
     for m in ("adt", "atac"):
         if (ref.get(m) is not None) != (qry.get(m) is not None):
             warnings.warn("modality %r is present in only one of reference/query; it will be "
@@ -566,13 +658,61 @@ def transfer(reference, query, labels=None, query_labels=None, *,
     fit = train(ref_sub["rna"], adt=ref_sub.get("adt"), atac=ref_sub.get("atac"),
                 labels=labels, batch_size=batch_size, epochs=epochs, lr=lr, z_dim=z_dim,
                 hidden_rna=hidden_rna, hidden_adt=hidden_adt, hidden_atac=hidden_atac,
-                seed=seed, device=device)
+                seed=seed, augmentation=augmentation, device=device)
     res = task(qry_sub["rna"], adt=qry_sub.get("adt"), atac=qry_sub.get("atac"),
-               labels=query_labels, model=fit, classification=classification, query=True,
-               fs=fs, fs_method=fs_method, dim_reduce=dim_reduce, simulation=simulation,
-               simulation_ct=simulation_ct, simulation_num=simulation_num,
-               include_real=include_real, batch_size=batch_size, z_dim=z_dim,
-               hidden_rna=hidden_rna, hidden_adt=hidden_adt, hidden_atac=hidden_atac,
-               seed=seed, out_dir=out_dir, device=device)
+               labels=query_labels, model=fit, classification=True, query=True,
+               batch_size=batch_size, z_dim=z_dim, hidden_rna=hidden_rna,
+               hidden_adt=hidden_adt, hidden_atac=hidden_atac, seed=seed,
+               out_dir=out_dir, device=device)
+    res.retrained = True
     res.common_features = common
     return res
+
+
+def reduce(data, model=None, *, labels=None, query=False, batch_size=64, z_dim=100,
+           hidden_rna=185, hidden_adt=30, hidden_atac=185, seed=1, out_dir=None, device="auto"):
+    """Project ``data`` into the trained model's integrated latent space (dimension reduction).
+
+    Thin wrapper over :func:`task` with ``dim_reduce=True``. ``data`` is an ``AnnData`` or a
+    ``{"rna","adt","atac"}`` dict; ``model`` is a :class:`TrainResult`. ``labels`` is optional
+    (only to annotate the latent coordinates). Returns a :class:`TaskResult` with ``.latent``.
+    """
+    rna, adt, atac = _unpack(data)
+    return task(rna, adt=adt, atac=atac, labels=labels, model=model, dim_reduce=True,
+                query=query, batch_size=batch_size, z_dim=z_dim, hidden_rna=hidden_rna,
+                hidden_adt=hidden_adt, hidden_atac=hidden_atac, seed=seed,
+                out_dir=out_dir, device=device)
+
+
+def markers(data, model=None, *, method="IntegratedGradient", labels=None, query=False,
+            batch_size=64, z_dim=100, hidden_rna=185, hidden_adt=30, hidden_atac=185,
+            seed=1, out_dir=None, device="auto"):
+    """Per-cell-type feature importance (feature selection / marker discovery).
+
+    Thin wrapper over :func:`task` with ``fs=True``. ``method`` is ``"IntegratedGradient"``
+    (default) or ``"Saliency"``. ``labels`` should be the data's cell-type labels (importances
+    are computed per class). Returns a :class:`TaskResult` with ``.markers``.
+    """
+    rna, adt, atac = _unpack(data)
+    return task(rna, adt=adt, atac=atac, labels=labels, model=model, fs=True,
+                fs_method=method, query=query, batch_size=batch_size, z_dim=z_dim,
+                hidden_rna=hidden_rna, hidden_adt=hidden_adt, hidden_atac=hidden_atac,
+                seed=seed, out_dir=out_dir, device=device)
+
+
+def simulate(data, model=None, *, celltype=None, n=100, labels=None, query=False,
+             include_real=False, batch_size=64, z_dim=100, hidden_rna=185, hidden_adt=30,
+             hidden_atac=185, seed=1, out_dir=None, device="auto"):
+    """Generate synthetic cells from the trained VAE.
+
+    Thin wrapper over :func:`task` with ``simulation=True``. ``celltype`` is the cell type to
+    simulate (must be in the model's classes and in ``labels``); ``celltype=None`` reconstructs
+    all cells (the engine's ``-1`` sentinel). ``n`` is the number of cells to draw. Returns a
+    :class:`TaskResult` with ``.simulated`` (add ``include_real=True`` for the real cells too).
+    """
+    rna, adt, atac = _unpack(data)
+    return task(rna, adt=adt, atac=atac, labels=labels, model=model, simulation=True,
+                simulation_ct=("-1" if celltype is None else celltype), simulation_num=n,
+                include_real=include_real, query=query, batch_size=batch_size, z_dim=z_dim,
+                hidden_rna=hidden_rna, hidden_adt=hidden_adt, hidden_atac=hidden_atac,
+                seed=seed, out_dir=out_dir, device=device)
