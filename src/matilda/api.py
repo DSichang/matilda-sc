@@ -298,7 +298,7 @@ def _read_markers(out_root, mode, split):
     return pd.DataFrame(rows, columns=["celltype", "feature", "importance"]) if rows else None
 
 
-def _read_simulation(out_root, mode, split):
+def _read_simulation(out_root, mode, split, include_real=False):
     base = os.path.join(out_root, "simulation_result", mode, split)
     out = {}
     for m in ("rna", "adt", "atac"):
@@ -308,6 +308,14 @@ def _read_simulation(out_root, mode, split):
     lf = os.path.join(base, "sim_label.csv")
     if os.path.isfile(lf):
         out["label"] = pd.read_csv(lf, index_col=0)
+    if include_real:                                 # the real reference cells, same feature space
+        for m in ("rna", "adt", "atac"):
+            f = os.path.join(base, "real_data_%s.csv" % m)
+            if os.path.isfile(f):
+                out["real_%s" % m] = pd.read_csv(f, index_col=0)
+        rlf = os.path.join(base, "real_label.csv")
+        if os.path.isfile(rlf):
+            out["real_label"] = pd.read_csv(rlf, index_col=0)
     return out or None
 
 
@@ -380,7 +388,7 @@ def train(rna, adt=None, atac=None, labels=None, *, batch_size=64, epochs=30, lr
 
 def task(rna, adt=None, atac=None, labels=None, *, model=None, classification=False,
          query=False, fs=False, fs_method="IntegratedGradient", dim_reduce=False,
-         simulation=False, simulation_ct=None, simulation_num=100,
+         simulation=False, simulation_ct=None, simulation_num=100, include_real=False,
          batch_size=64, z_dim=100, hidden_rna=185, hidden_adt=30, hidden_atac=185,
          seed=1, out_dir=None, device="auto"):
     """Run one or more tasks with a trained model and return a :class:`TaskResult`.
@@ -394,6 +402,9 @@ def task(rna, adt=None, atac=None, labels=None, *, model=None, classification=Fa
     ``fs_method``: ``"IntegratedGradient"`` (default) or ``"Saliency"``.
     ``simulation``: requires ``labels`` and ``simulation_ct`` — a cell type present in the
     model's classes *and* in ``labels``, or the sentinel ``"-1"`` to simulate all cells.
+    ``include_real=True`` also returns the real reference cells (``result.simulated`` then
+    holds ``real_rna`` / ``real_adt`` / ``real_atac`` / ``real_label`` alongside the
+    simulated ones), in the same feature space — useful for real-vs-simulated comparison.
     ``device``: see :func:`resolve_device`.
     """
     if model is None:
@@ -478,7 +489,7 @@ def task(rna, adt=None, atac=None, labels=None, *, model=None, classification=Fa
         if fs:
             res.markers = _read_markers(out_root, mode, split)
         if simulation:
-            res.simulated = _read_simulation(out_root, mode, split)
+            res.simulated = _read_simulation(out_root, mode, split, include_real=include_real)
 
         if out_dir:
             dst = os.path.join(out_dir, "output")
