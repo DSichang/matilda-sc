@@ -26,7 +26,11 @@ classifiers = [
 ]
 dependencies = [
     "torch",
-    "captum",
+    # captum is pinned to match the R package's bundled (basilisk) stack: its Integrated
+    # Gradients output drives the feature-selection / marker scores, and it changes across
+    # captum versions — so R and Python only give the same markers on the same captum.
+    # (captum is pure-Python, so this pin installs on any Python / torch.)
+    "captum==0.7.0",
     "h5py",
     "numpy",
     "pandas",
