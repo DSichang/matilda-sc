@@ -83,8 +83,3 @@ RNA-only runs use `rna_train` / `rna_task` (same signatures without the ADT/ATAC
 These write outputs to `../trained_model/` and `../output/` relative to the working
 directory; the object API above wraps this and returns the results instead.
 
-## Status
-
-Work in progress: call-side modernization of the published Matilda engine. The
-numerical model is frozen; results are bit-identical to the original engine for a
-given device + seed + library versions.
