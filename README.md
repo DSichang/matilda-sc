@@ -1,31 +1,43 @@
-# matilda-sc
+# Matilda
 
-Multi-task framework for single-cell **multimodal** data (RNA / ADT / ATAC):
-joint cell-type **classification**, **dimension reduction**, **feature selection**,
-data **simulation**, and **augmentation** in one model.
+**Multi-task learning from single-cell multimodal omics (RNA + ADT + ATAC), in Python and R.**
 
-> The import name is `matilda`; the PyPI distribution is `matilda-sc`.
-> The model is unchanged from the published engine — this package modernizes the
-> call side (importability, packaging, I/O, and return objects).
+Matilda trains one multimodal variational autoencoder plus classifier and reuses it for five
+tasks: **classification, dimension reduction, feature selection, data simulation**, and
+training-time **augmentation**. The model is the **unchanged** published engine; this package
+modernizes the call side (importability, packaging, I/O, and object returns), so results are
+bit-identical to the original for a given device, seed, and library versions.
+
+- **Documentation:** https://dsichang.github.io/matilda-sc/
+- **Python tutorial (Colab):** [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/DSichang/matilda-sc/blob/main/colab/tutorial-python.ipynb)
+- **R tutorial (Colab):** [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/DSichang/matilda-r/blob/main/inst/colab/tutorial-r.ipynb)
+- **R package:** https://github.com/DSichang/matilda-r (SingleCellExperiment-based, Bioconductor-style)
 
 ## Install
 
-During development / testing (from GitHub):
+**Python** (import name `matilda`; PyPI distribution `matilda-sc`):
 
 ```bash
-pip install "git+https://github.com/DSichang/matilda-sc.git"
+pip install "git+https://github.com/DSichang/matilda-sc.git"   # once on PyPI: pip install matilda-sc
 ```
 
-Once published to PyPI:
+**R** (Python is provisioned automatically by `basilisk`, so you never install or manage it):
 
-```bash
-pip install matilda-sc
+```r
+remotes::install_github("DSichang/matilda-r")
 ```
 
-## Quickstart (object API — recommended)
+## Two interfaces, one engine
 
-Work with in-memory `AnnData` (or arrays, or file paths) and get results back as objects.
-After `train`, there is one verb per task: `classify` / `reduce` / `markers` / `simulate`.
+Matilda ships as a Python package (`import matilda`) and an R package (`matilda`, operating on a
+`SingleCellExperiment`). Both call the **same** engine, so on the same hardware they give the same
+result. Pick the interface that matches your workflow; see the [documentation](https://dsichang.github.io/matilda-sc/)
+for both APIs and full tutorials.
+
+## Quickstart (Python)
+
+Work with in-memory `AnnData` (or arrays, or file paths) and get results back as objects. After
+`train`, there is one verb per task: `classify` / `reduce` / `markers` / `simulate`.
 
 ```python
 import matilda
@@ -34,52 +46,24 @@ import matilda
 # labels: a vector, an `.obs` column name, or a .csv path (string or numeric labels)
 fit = matilda.train(rna, adt=adt, atac=atac, labels="cell_type")
 
-# each verb takes the data (AnnData or {"rna","adt","atac"}) and the trained model
 res = matilda.classify({"rna": q_rna, "adt": q_adt, "atac": q_atac},
                        model=fit, query_labels=q_labels)
 res.predictions        # DataFrame: cell_id, real, predicted, probability
 res.celltype_accuracy  # DataFrame: celltype, accuracy, n
 
-lat = matilda.reduce({"rna": rna, "adt": adt, "atac": atac}, model=fit)                 # lat.latent
-mk  = matilda.markers({"rna": rna, "adt": adt, "atac": atac}, model=fit, labels="cell_type")  # mk.markers
-sim = matilda.simulate({"rna": rna}, model=fit, celltype="B.Naive", n=200)             # sim.simulated
+lat = matilda.reduce({"rna": rna, "adt": adt, "atac": atac}, model=fit)                        # lat.latent
+mk  = matilda.markers({"rna": rna, "adt": adt, "atac": atac}, model=fit, labels="cell_type")   # mk.markers
+sim = matilda.simulate({"rna": rna}, model=fit, celltype="B.Naive", n=200)                     # sim.simulated
 ```
 
-The modality combination is inferred automatically (RNA only → RNA-only model; +ADT →
-CITE-seq; +ATAC → SHARE-seq; +both → TEA-seq).
+The modality combination is inferred automatically (RNA only, RNA+ADT for CITE-seq, RNA+ATAC for
+SHARE-seq, all three for TEA-seq). `classify` reconciles features automatically: if the query is
+missing some of the model's features it takes the per-modality reference intersection (real values,
+no zero-padding), retrains, and classifies; `res.retrained` / `res.common_features` report what
+happened. See the [Quickstart](https://dsichang.github.io/matilda-sc/quickstart/) and
+[API reference](https://dsichang.github.io/matilda-sc/api-python/) for the full surface.
 
-**`classify` reconciles features automatically.** The call is the same whether or not the
-query shares the reference panel: if the query carries every feature the model needs it
-reuses the model; if it is missing some (the common cross-dataset case) it takes the
-per-modality reference∩query **intersection** — real values, **no zero-padding** — retrains
-on it, and classifies. `res.retrained` / `res.common_features` report what happened:
+## Citation
 
-```python
-res = matilda.classify({"rna": q_rna_small, "adt": q_adt, "atac": q_atac},
-                       model=fit, reference={"rna": rna, "adt": adt, "atac": atac},
-                       labels="cell_type", query_labels=q_labels)
-```
-
-The combinable `matilda.task(..., classification=True, dim_reduce=True, fs=True,
-simulation=True)` runs any mix of tasks in one engine pass (the verbs wrap it). Pass
-`out_dir=` to also write artifacts to disk; otherwise the trained model lives in a temp
-dir (`fit.model_dir`) for the session and is cleaned up at exit.
-
-I/O helpers in `matilda.io` convert to/from the engine's format:
-`read_matilda_h5`, `to_matilda_h5`, `to_matilda_cty`, `from_10x(dir)` (reads ADT/ATAC too).
-
-## Lower-level path-based API
-
-The original engine functions remain available and take file paths:
-
-```python
-from matilda import main_train, main_task
-main_train("train_rna.h5", "train_adt.h5", "train_atac.h5", "train_cty.csv", seed=1)
-main_task("test_rna.h5", "test_adt.h5", "test_atac.h5", "test_cty.csv",
-          classification=True, query=True, seed=1)
-```
-
-RNA-only runs use `rna_train` / `rna_task` (same signatures without the ADT/ATAC arguments).
-These write outputs to `../trained_model/` and `../output/` relative to the working
-directory; the object API above wraps this and returns the results instead.
-
+If you use Matilda, please cite the Matilda paper (see the
+[Citation](https://dsichang.github.io/matilda-sc/citation/) page).

@@ -1,8 +1,8 @@
 site_name: Matilda
 site_description: "Matilda, multi-task learning for single-cell multimodal omics (RNA + ADT + ATAC): classification, dimension reduction, feature selection, simulation. One model, in Python and R."
 site_author: PYangLab
-# Deployed to GitHub Pages from a private repo (Pro). Public, shareable URL:
-site_url: https://dsichang.github.io/matilda-docs/
+# Test mirror deploys from DSichang/matilda-sc; promote_to_pyanglab.sh rewrites this to PYangLab.
+site_url: https://dsichang.github.io/matilda-sc/
 repo_url: https://github.com/PYangLab/Matilda
 repo_name: PYangLab/Matilda
 
